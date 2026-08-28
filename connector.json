@@ -1,0 +1,117 @@
+{
+  "name": "gmail",
+  "displayName": "Gmail",
+  "icon": "icon.png",
+  "description": "Highly popular email service by Google. Gmail tracks all of your email conversations.",
+  "setup": {
+    "title": "Create a Google Cloud OAuth app",
+    "steps": [
+      {
+        "text": "Enable the Gmail API for your Google Cloud project.",
+        "link": {
+          "label": "Enable the Gmail API",
+          "url": "https://console.cloud.google.com/apis/library/gmail.googleapis.com"
+        }
+      },
+      {
+        "text": "On the OAuth consent screen, set User type to Internal.",
+        "link": {
+          "label": "OAuth consent screen",
+          "url": "https://console.cloud.google.com/apis/credentials/consent"
+        },
+        "why": "Internal avoids the Google app verification and annual CASA security assessment that Gmail's restricted scopes otherwise require, and stops refresh tokens expiring every 7 days.",
+        "values": [
+          "Internal"
+        ]
+      },
+      {
+        "text": "In Credentials, create an OAuth client ID of type Web application, then add this redirect URI to its Authorised redirect URIs:",
+        "link": {
+          "label": "Credentials",
+          "url": "https://console.cloud.google.com/apis/credentials"
+        },
+        "why": "Google rejects the authorization if the redirect URI does not match character for character, including the scheme and any trailing slash.",
+        "showRedirectUri": true,
+        "values": [
+          "Web application"
+        ]
+      }
+    ],
+    "notes": {
+      "authorize": "Sign in as the SHARED MAILBOX ACCOUNT, not as yourself. Whichever account approves this is the mailbox everyone will read — read-only, so nothing can be sent, labelled or deleted.",
+      "verify": "This reports which mailbox you are actually connected to — worth reading before you rely on it."
+    },
+    "docs": [
+      {
+        "label": "Gmail API scopes reference",
+        "url": "https://developers.google.com/gmail/api/auth/scopes"
+      }
+    ]
+  },
+  "authors": [
+    {
+      "name": "Anthony Montalbano",
+      "email": "amontalbano@gmail.com"
+    }
+  ],
+  "credentialFields": [
+    {
+      "key": "clientId",
+      "label": "Client ID",
+      "type": "text"
+    },
+    {
+      "key": "clientSecret",
+      "label": "Client Secret",
+      "type": "password"
+    }
+  ],
+  "auth": {
+    "strategy": "oauth2_authorization_code",
+    "authorizeUrl": "https://accounts.google.com/o/oauth2/v2/auth?access_type=offline&prompt=consent",
+    "tokenUrl": "https://oauth2.googleapis.com/token",
+    "tokenAuth": "post",
+    "credentialKeys": [
+      "clientId",
+      "clientSecret"
+    ],
+    "scopes": [
+      "https://www.googleapis.com/auth/gmail.readonly"
+    ],
+    "scopesUrl": "https://developers.google.com/gmail/api/auth/scopes"
+  },
+  "http": {
+    "baseUrl": "https://gmail.googleapis.com",
+    "timeoutMs": 10000,
+    "deadlineMs": 20000,
+    "maxAttempts": 3,
+    "maxResponseBytes": 20971520
+  },
+  "telemetry": [
+    {
+      "method": "listMessages",
+      "description": "Listed or searched messages"
+    },
+    {
+      "method": "searchMessages",
+      "description": "Searched messages and read their contents"
+    },
+    {
+      "method": "getMessage",
+      "description": "Read one message"
+    },
+    {
+      "method": "getThread",
+      "description": "Read one conversation thread"
+    },
+    {
+      "method": "listLabels",
+      "description": "Listed mailbox labels"
+    },
+    {
+      "method": "getAttachment",
+      "description": "Downloaded an attachment"
+    }
+  ],
+  "lastUpdated": "2026-08-28T05:31:50.135Z"
+}
