@@ -3,6 +3,16 @@
   "displayName": "Gmail",
   "icon": "assets/icon.png",
   "description": "Highly popular email service by Google. Gmail tracks all of your email conversations.",
+  "tagline": "Read Gmail messages, threads and labels",
+  "keywords": [
+    "email",
+    "gmail",
+    "google",
+    "inbox"
+  ],
+  "license": "MPL-2.0",
+  "connectorUrl": "https://github.com/italianst4/mixos/tree/main/connectors/gmail",
+  "connectorSupportUrl": "https://github.com/italianst4/mixos/issues",
   "setup": {
     "title": "Create a Google Cloud OAuth app",
     "steps": [
@@ -196,5 +206,5 @@
       "description": "Downloaded an attachment"
     }
   ],
-  "lastUpdated": "2026-08-29T15:30:02.322Z"
+  "lastUpdated": "2026-09-14T03:55:51.997Z"
 }
