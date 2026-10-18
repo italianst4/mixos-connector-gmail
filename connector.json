@@ -11,8 +11,8 @@
     "inbox"
   ],
   "license": "MPL-2.0",
-  "connectorUrl": "https://github.com/italianst4/mixos/tree/main/connectors/gmail",
-  "connectorSupportUrl": "https://github.com/italianst4/mixos/issues",
+  "connectorUrl": "https://github.com/italianst4/mixos-connector-gmail",
+  "connectorSupportUrl": "https://github.com/italianst4/mixos-connector-gmail/issues",
   "setup": {
     "title": "Create a Google Cloud OAuth app",
     "steps": [
