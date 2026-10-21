@@ -7,16 +7,36 @@ import { HttpConnector } from "@/lib/connectors/http-connector";
 import type { ConnectorTestResult } from "@/lib/connectors/types";
 
 /**
- * Gmail — read-only, one shared mailbox.
+ * Gmail: the Gmail API v1's profile, messages, attachments, threads and
+ * labels, for one shared mailbox.
+ *
+ * It mirrors the API. One method per operation, named after it, taking the
+ * operation's own parameters and returning its own resource, typed, with every
+ * field Google sends. Apps compose these; nothing here is shaped for one app.
+ * `operation` in connector.json names the API method each one calls.
+ *
+ * Reads need `gmail.readonly`, which is always requested. The methods declared
+ * `mutates` need `gmail.modify`, which the manifest requests with "write":
+ * asked for at Connect only once an admin has allowed this connector to change
+ * data. Until then the platform refuses those methods before they run, and the
+ * grant doesn't hold the scope either.
+ *
+ * Left out on purpose:
+ *
+ *  - `users.messages.delete`, `users.messages.batchDelete` and
+ *    `users.threads.delete`. They delete for good, skipping Trash, and need
+ *    full access to the mailbox, `https://mail.google.com/`. Trash and untrash
+ *    are here.
+ *  - `users.watch` and `users.stop`. They push changes through a Cloud Pub/Sub
+ *    topic, whose deliveries carry Google-signed tokens that the platform's
+ *    webhooks don't verify.
  *
  * **This is not per-user mail access.** Connectors on this platform are
  * tenant-scoped: an admin presses Connect once and every user of every app
- * reads that single mailbox. There is no way for this connector to reach an
+ * reaches that single mailbox. There is no way for this connector to reach an
  * individual user's own inbox, and it must not be presented as if it can.
  *
- * Design notes worth knowing before editing — the full reasoning, with links to
- * the base-layer code each one depends on, is in
- * `plans/20260826_2244-gmail-connector.md`:
+ * Design notes worth knowing before editing — the reasoning is in `plans/`:
  *
  *  - `access_type=offline&prompt=consent` rides in the manifest's
  *    `authorizeUrl` query string, because `buildAuthorizeUrl` only emits the
@@ -24,178 +44,282 @@ import type { ConnectorTestResult } from "@/lib/connectors/types";
  *  - `rateLimitOn403` is deliberately NOT declared: it would reclassify a
  *    missing-scope 403 as a retryable throttle, which is the most likely 403
  *    here. A real throttle carrying `Retry-After` still classifies correctly.
- *  - `listMessages` walks pages itself rather than using `this.paginate()`,
- *    because Gmail omits the `messages` key entirely on an empty result and
- *    `paginate()` would raise `unexpected_response` for an empty inbox.
- *    Retries, backoff and auth still come from `this.request()`.
+ *  - A message comes back as Google's `Message`, its MIME tree intact, with
+ *    `decoded` beside it: its headers, its first text and HTML bodies, and its
+ *    attachments, read from that tree. Every caller would otherwise repeat the
+ *    base64url and MIME walk, and the tree stays for anything it skips.
+ *  - Retries follow what repeating does. A modify, a trash or untrash, and a
+ *    label update or patch land the same however often they run, and are
+ *    retried. A send, an insert and an import are not, since each run adds the
+ *    message again, and nor is a label create, whose repeat would fail on the
+ *    name it had just taken.
  */
 
-/** Gmail caps `maxResults` here; asking for more is silently truncated. */
-const MAX_RESULTS_PER_PAGE = 500;
-/** Hard stop on the page walk so a stuck `nextPageToken` cannot spin. */
-const MAX_PAGES = 20;
-/**
- * Hydrating a list costs one `messages.get` per message. Bounded and issued
- * sequentially so a widget cannot fan out against Gmail's per-user quota and
- * trip a 403 throttle that we intentionally do not retry.
- */
-const MAX_HYDRATE = 25;
 /** Depth guard on the MIME walk. Real mail nests two or three deep. */
 const MAX_PART_DEPTH = 20;
 
-// ── Upstream shapes ─────────────────────────────────────────────────────────
+// ── Google's resources ──────────────────────────────────────────────────────
+//
+// Each declares the fields Google documents, as `looseObject`, so every field
+// it doesn't name still reaches the app. See the Gmail API reference:
+// https://developers.google.com/workspace/gmail/api/reference/rest
 
-const Header = z.object({ name: z.string(), value: z.string() });
+const MessagePartHeaderSchema = z.looseObject({
+  name: z.string(),
+  value: z.string(),
+});
+export type MessagePartHeader = z.infer<typeof MessagePartHeaderSchema>;
 
-type RawPart = {
-  partId?: string;
-  mimeType?: string;
-  filename?: string;
-  headers?: { name: string; value: string }[];
-  body?: { attachmentId?: string; size?: number; data?: string };
-  parts?: RawPart[];
-};
+/** A part's content, base64url in `data`, or where to fetch it: `attachmentId`. */
+const MessagePartBodySchema = z.looseObject({
+  attachmentId: z.string().optional(),
+  /** Bytes in the part, before base64url. */
+  size: z.number().optional(),
+  data: z.string().optional(),
+});
+export type MessagePartBody = z.infer<typeof MessagePartBodySchema>;
 
-const RawPart: z.ZodType<RawPart> = z.lazy(() =>
-  z.object({
-    partId: z.string().optional(),
-    mimeType: z.string().optional(),
-    filename: z.string().optional(),
-    headers: z.array(Header).optional(),
-    body: z
-      .object({
-        attachmentId: z.string().optional(),
-        size: z.number().optional(),
-        data: z.string().optional(),
-      })
-      .optional(),
-    parts: z.array(RawPart).optional(),
-  }),
-);
+/** One node of a message's MIME tree. A multipart part holds the rest in `parts`. */
+const MessagePartSchema = z.looseObject({
+  partId: z.string().optional(),
+  mimeType: z.string().optional(),
+  filename: z.string().optional(),
+  headers: z.array(MessagePartHeaderSchema).optional(),
+  body: MessagePartBodySchema.optional(),
+  get parts(): z.ZodOptional<z.ZodArray<typeof MessagePartSchema>> {
+    return z.array(MessagePartSchema).optional();
+  },
+});
+export type MessagePart = z.infer<typeof MessagePartSchema>;
 
-/** `payload` is absent for `format=minimal`, and body-less for `metadata`. */
-const RawMessage = z.object({
+/**
+ * A message. Which fields arrive depends on `format`: `payload` is absent for
+ * "minimal" and "raw" and has no bodies for "metadata", and `raw` comes only
+ * with "raw". A write answers with `id`, `threadId` and `labelIds`.
+ */
+const MessageSchema = z.looseObject({
   id: z.string(),
   threadId: z.string(),
   labelIds: z.array(z.string()).optional(),
   snippet: z.string().optional(),
+  historyId: z.string().optional(),
+  /** When Gmail received it: epoch milliseconds, as a string. */
   internalDate: z.string().optional(),
   sizeEstimate: z.number().optional(),
-  payload: RawPart.optional(),
+  payload: MessagePartSchema.optional(),
+  /** The whole RFC 2822 message, base64url-encoded. */
+  raw: z.string().optional(),
 });
-type RawMessage = z.infer<typeof RawMessage>;
+export type Message = z.infer<typeof MessageSchema>;
+
+/** A message as a list names it. Read it with `getMessage`. */
+const MessageRefSchema = z.looseObject({
+  id: z.string(),
+  threadId: z.string(),
+});
+export type MessageRef = z.infer<typeof MessageRefSchema>;
 
 /**
- * `messages` is optional on purpose: Gmail returns `{"resultSizeEstimate": 0}`
- * with no `messages` key when a search matches nothing. Making this required
- * would turn an empty inbox into `unexpected_response`.
+ * One page of messages. Gmail leaves `messages` out, rather than sending an
+ * empty list, when nothing matched.
  */
-const RawMessageList = z.object({
-  messages: z.array(z.object({ id: z.string(), threadId: z.string() })).optional(),
+const ListMessagesResponseSchema = z.looseObject({
+  messages: z.array(MessageRefSchema).optional(),
+  nextPageToken: z.string().optional(),
+  /** Gmail's estimate of all the matches, not a count of this page. */
+  resultSizeEstimate: z.number().optional(),
+});
+export type ListMessagesResponse = z.infer<typeof ListMessagesResponseSchema>;
+
+/** A thread as a list names it. `getThread` adds its messages. */
+const ThreadSchema = z.looseObject({
+  id: z.string(),
+  snippet: z.string().optional(),
+  historyId: z.string().optional(),
+});
+export type Thread = z.infer<typeof ThreadSchema>;
+
+const ThreadWithMessagesSchema = z.looseObject({
+  ...ThreadSchema.shape,
+  /** Oldest first. */
+  messages: z.array(MessageSchema).optional(),
+});
+
+/** One page of threads. `threads` is left out when nothing matched. */
+const ListThreadsResponseSchema = z.looseObject({
+  threads: z.array(ThreadSchema).optional(),
   nextPageToken: z.string().optional(),
   resultSizeEstimate: z.number().optional(),
 });
+export type ListThreadsResponse = z.infer<typeof ListThreadsResponseSchema>;
 
-const RawThread = z.object({
-  id: z.string(),
-  historyId: z.string().optional(),
-  messages: z.array(RawMessage).optional(),
+const LabelColorSchema = z.looseObject({
+  textColor: z.string().optional(),
+  backgroundColor: z.string().optional(),
 });
 
-const RawLabel = z.object({
+/**
+ * A label. `type` is "system" for Gmail's own, such as INBOX and UNREAD, and
+ * "user" for the mailbox's. Only `getLabel` sends the counts.
+ */
+const LabelSchema = z.looseObject({
   id: z.string(),
   name: z.string(),
   type: z.string().optional(),
+  messageListVisibility: z.string().optional(),
+  labelListVisibility: z.string().optional(),
   messagesTotal: z.number().optional(),
   messagesUnread: z.number().optional(),
+  threadsTotal: z.number().optional(),
+  threadsUnread: z.number().optional(),
+  color: LabelColorSchema.optional(),
 });
+export type Label = z.infer<typeof LabelSchema>;
 
-const RawLabelList = z.object({ labels: z.array(RawLabel).optional() });
-
-const RawAttachment = z.object({
-  size: z.number().optional(),
-  data: z.string().optional(),
+const ListLabelsResponseSchema = z.looseObject({
+  labels: z.array(LabelSchema).optional(),
 });
+export type ListLabelsResponse = z.infer<typeof ListLabelsResponseSchema>;
 
-const RawProfile = z.object({
-  emailAddress: z.string().optional(),
+/** The connected mailbox. */
+const ProfileSchema = z.looseObject({
+  emailAddress: z.string(),
   messagesTotal: z.number().optional(),
+  threadsTotal: z.number().optional(),
+  historyId: z.string().optional(),
 });
+export type Profile = z.infer<typeof ProfileSchema>;
 
-// ── What apps receive ───────────────────────────────────────────────────────
+// ── What a message adds ─────────────────────────────────────────────────────
 
-export type GmailLabel = z.infer<typeof RawLabel>;
-
-/** What a list returns: Gmail gives ids only, never content. */
-export interface GmailMessageRef {
-  id: string;
-  threadId: string;
-}
-
-export interface GmailMessagePage {
-  messages: GmailMessageRef[];
-  /** Pass back as `pageToken` to continue. Null when the walk is complete. */
-  nextPageToken: string | null;
-  /** Gmail's own estimate — approximate, and not a count of `messages`. */
-  resultSizeEstimate: number;
-}
-
-export interface GmailAttachmentRef {
+/** A part with an attachment id. Fetch its bytes with `getAttachment`. */
+export interface AttachmentPart {
+  /** Stable for the message, where `attachmentId` can change between reads. */
+  partId?: string;
   attachmentId: string;
   filename: string;
   mimeType: string;
   size: number;
 }
 
-export interface GmailMessage {
-  id: string;
-  threadId: string;
-  labelIds: string[];
-  snippet: string;
-  /** Epoch milliseconds as a string, exactly as Gmail sends it. */
-  internalDate: string | null;
-  sizeEstimate: number | null;
-  /** Every header, keys lowercased. */
+/** A message's MIME tree, read. Empty for a format that has none. */
+export interface DecodedMessage {
+  /** The message's headers, names lowercased: `decoded.headers.subject`. */
   headers: Record<string, string>;
-  from: string | null;
-  to: string | null;
-  cc: string | null;
-  subject: string | null;
-  date: string | null;
-  /** Decoded `text/plain` body, when the message has one. */
+  /** The first `text/plain` body, decoded, or null. */
   text: string | null;
-  /** Decoded `text/html` body, when the message has one. */
+  /** The first `text/html` body, decoded, or null. */
   html: string | null;
-  /** Metadata only — fetch the bytes with `getAttachment`. */
-  attachments: GmailAttachmentRef[];
+  attachments: AttachmentPart[];
 }
 
-export interface GmailThread {
-  id: string;
-  messages: GmailMessage[];
-}
+/** Google's `Message`, with `decoded` beside its MIME tree. */
+export type GmailMessage = Message & { decoded: DecodedMessage };
 
-export type GmailFormat = "full" | "metadata" | "minimal";
+/** Google's `Thread`, each of its messages a `GmailMessage`. */
+export type GmailThread = Thread & { messages?: GmailMessage[] };
 
-export interface GmailListOptions {
-  /**
-   * Gmail search syntax — `from:`, `subject:`, `is:unread`, `newer_than:7d`,
-   * `has:attachment`, `label:`. Multiple labels are expressed here.
-   */
+/** Google's `MessagePartBody` for an attachment, with its bytes decoded. */
+export type GmailAttachment = MessagePartBody & { bytes: Buffer };
+
+// ── What the methods take ───────────────────────────────────────────────────
+
+/** The parameters `users.messages.list` and `users.threads.list` share. */
+export interface ListOptions {
+  /** Gmail search syntax, as in its search box: `from:`, `is:unread`, `newer_than:7d`. */
   q?: string;
-  /** Messages to return. Defaults to 25. */
-  limit?: number;
-  /** Continue a previous page. */
+  /** How many per page. Gmail's default is 100, and its most 500. */
+  maxResults?: number;
+  /** The `nextPageToken` of the page before. */
   pageToken?: string;
-  /** Label IDs to intersect, e.g. `["INBOX", "UNREAD"]`. */
-  labelIds?: string[];
+  /** Only those with every one of these labels. */
+  labelIds?: readonly string[];
+  /** Include Spam and Trash too. */
   includeSpamTrash?: boolean;
 }
 
-export interface GmailSearchOptions extends GmailListOptions {
-  /** Defaults to "full", which is what carries the message body. */
-  format?: GmailFormat;
+export interface GetMessageOptions {
+  /**
+   * "full", Gmail's default: headers and bodies, as the MIME tree. "metadata":
+   * headers only. "minimal": ids and labels. "raw": the whole message, as
+   * base64url in `raw`.
+   */
+  format?: "full" | "metadata" | "minimal" | "raw";
+  /** With "metadata", only these headers. */
+  metadataHeaders?: readonly string[];
 }
+
+export interface GetThreadOptions {
+  /** As for `getMessage`, without "raw". */
+  format?: "full" | "metadata" | "minimal";
+  metadataHeaders?: readonly string[];
+}
+
+/** Labels to add and remove. Archiving removes INBOX; marking read removes UNREAD. */
+export interface LabelChanges {
+  addLabelIds?: readonly string[];
+  removeLabelIds?: readonly string[];
+}
+
+/** A message to add to the mailbox: RFC 2822, base64url-encoded, in `raw`. */
+export interface MessageInput {
+  raw: string;
+  labelIds?: readonly string[];
+  /** The thread to add it to. Its Subject and References must match the thread's. */
+  threadId?: string;
+}
+
+export interface InsertMessageOptions {
+  /** Where its internal date comes from. Gmail's default is "receivedTime". */
+  internalDateSource?: "receivedTime" | "dateHeader";
+  /** Mark it deleted, so only Google Vault sees it. Google Workspace only. */
+  deleted?: boolean;
+}
+
+export interface ImportMessageOptions {
+  /** Where its internal date comes from. Gmail's default is "dateHeader". */
+  internalDateSource?: "receivedTime" | "dateHeader";
+  /** Never classify it as spam. */
+  neverMarkSpam?: boolean;
+  /** Add any calendar invitations in it to the calendar. */
+  processForCalendar?: boolean;
+  /** Mark it deleted, so only Google Vault sees it. Google Workspace only. */
+  deleted?: boolean;
+}
+
+/** A label's name, and where Gmail shows it. */
+export interface LabelInput {
+  name: string;
+  /** In the message list. */
+  messageListVisibility?: "show" | "hide";
+  /** In the label list. */
+  labelListVisibility?: "labelShow" | "labelShowIfUnread" | "labelHide";
+  /** Hex colors from Gmail's palette, such as "#000000". */
+  color?: { textColor?: string; backgroundColor?: string };
+}
+
+const ME = "/gmail/v1/users/me";
+const messagePath = (id: string) => `${ME}/messages/${encodeURIComponent(id)}`;
+const threadPath = (id: string) => `${ME}/threads/${encodeURIComponent(id)}`;
+const labelPath = (id: string) => `${ME}/labels/${encodeURIComponent(id)}`;
+
+/** A JSON body, for a POST unless said otherwise. */
+const json = (body: unknown, method = "POST"): RequestInit => ({
+  method,
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify(body),
+});
+
+/** A POST with no body, as trash and untrash take. */
+const EMPTY_POST: RequestInit = { method: "POST" };
+
+const listQuery = (opts: ListOptions) => ({
+  q: opts.q,
+  maxResults: opts.maxResults,
+  pageToken: opts.pageToken,
+  labelIds: opts.labelIds,
+  includeSpamTrash: opts.includeSpamTrash,
+});
 
 export default class GmailConnector extends HttpConnector {
   readonly name = "gmail";
@@ -207,218 +331,267 @@ export default class GmailConnector extends HttpConnector {
    * rather than as the shared mailbox.
    */
   async testConnection(): Promise<ConnectorTestResult> {
-    const me = await this.request("/gmail/v1/users/me/profile", undefined, {
-      schema: RawProfile,
+    const profile = await this.requestBody(`${ME}/profile`, undefined, {
+      schema: ProfileSchema,
     });
-    return {
-      ok: true,
-      detail: me?.emailAddress ? `Connected to ${me.emailAddress}` : undefined,
-    };
+    return { ok: true, detail: `Connected to ${profile.emailAddress}` };
   }
+
+  /** `users.getProfile`: the connected mailbox's address and totals. */
+  async getProfile(): Promise<Profile> {
+    return this.requestBody(`${ME}/profile`, undefined, { schema: ProfileSchema });
+  }
+
+  // ── users.messages ───────────────────────────────────────────────────────
 
   /**
-   * Search or list message ids. Cheap: one call per 500 messages.
-   *
-   * Gmail returns ids only — no headers, no body. Use `getMessage` for one
-   * message, or `searchMessages` to list and read in a single call.
+   * `users.messages.list`: one page of message ids, newest first. Gmail sends
+   * ids only; read each with `getMessage`, at a pace its quota allows.
    */
-  async listMessages(opts: GmailListOptions = {}): Promise<GmailMessagePage> {
-    const limit = clamp(opts.limit ?? 25, 1, MAX_RESULTS_PER_PAGE * MAX_PAGES);
-    const messages: GmailMessageRef[] = [];
-    let pageToken: string | undefined = opts.pageToken;
-    let resultSizeEstimate = 0;
-
-    for (let page = 0; page < MAX_PAGES; page++) {
-      const remaining = limit - messages.length;
-      if (remaining <= 0) break;
-
-      const body = await this.request(this.messagesPath(opts.labelIds), undefined, {
-        schema: RawMessageList,
-        query: {
-          q: opts.q,
-          maxResults: Math.min(remaining, MAX_RESULTS_PER_PAGE),
-          pageToken,
-          includeSpamTrash: opts.includeSpamTrash,
-        },
-      });
-      if (!body) break;
-
-      resultSizeEstimate = body.resultSizeEstimate ?? resultSizeEstimate;
-      // Absent rather than empty when nothing matched — not an error.
-      messages.push(...(body.messages ?? []));
-
-      pageToken = body.nextPageToken;
-      if (!pageToken) break;
-    }
-
-    return {
-      messages: messages.slice(0, limit),
-      nextPageToken: pageToken ?? null,
-      resultSizeEstimate,
-    };
-  }
-
-  /**
-   * List and read in one call: the common case for rendering an inbox.
-   *
-   * Costs one call per message on top of the list, so it is capped at
-   * MAX_HYDRATE (25) and the reads are sequential. For more than that, page
-   * through `listMessages` and call `getMessage` at a rate you control.
-   */
-  async searchMessages(opts: GmailSearchOptions = {}): Promise<GmailMessage[]> {
-    const limit = clamp(opts.limit ?? 10, 1, MAX_HYDRATE);
-    const page = await this.listMessages({ ...opts, limit });
-
-    const out: GmailMessage[] = [];
-    for (const ref of page.messages) {
-      const message = await this.getMessage(ref.id, { format: opts.format });
-      if (message) out.push(message);
-    }
-    return out;
-  }
-
-  /**
-   * One message, with its MIME tree walked and the body decoded.
-   *
-   * `format` is "full" (headers plus body), "metadata" (headers only, no body)
-   * or "minimal" (labels and snippet only).
-   */
-  async getMessage(
-    id: string,
-    opts: { format?: GmailFormat } = {},
-  ): Promise<GmailMessage | null> {
-    const raw = await this.request(
-      `/gmail/v1/users/me/messages/${encodeURIComponent(id)}`,
-      undefined,
-      { schema: RawMessage, query: { format: opts.format ?? "full" } },
-    );
-    return raw ? shapeMessage(raw) : null;
-  }
-
-  /** A whole conversation, oldest first, each message decoded as above. */
-  async getThread(
-    id: string,
-    opts: { format?: GmailFormat } = {},
-  ): Promise<GmailThread | null> {
-    const raw = await this.request(
-      `/gmail/v1/users/me/threads/${encodeURIComponent(id)}`,
-      undefined,
-      { schema: RawThread, query: { format: opts.format ?? "full" } },
-    );
-    if (!raw) return null;
-    return { id: raw.id, messages: (raw.messages ?? []).map(shapeMessage) };
-  }
-
-  /** Every label, so callers can turn the ids on a message into names. */
-  async listLabels(): Promise<GmailLabel[]> {
-    const body = await this.request("/gmail/v1/users/me/labels", undefined, {
-      schema: RawLabelList,
+  async listMessages(opts: ListOptions = {}): Promise<ListMessagesResponse> {
+    return this.requestBody(`${ME}/messages`, undefined, {
+      schema: ListMessagesResponseSchema,
+      query: listQuery(opts),
     });
-    return body?.labels ?? [];
+  }
+
+  /** `users.messages.get`: one message, the whole of it unless `format` asks for less. */
+  async getMessage(id: string, opts: GetMessageOptions = {}): Promise<GmailMessage> {
+    const message = await this.requestBody(messagePath(id), undefined, {
+      schema: MessageSchema,
+      query: { format: opts.format, metadataHeaders: opts.metadataHeaders },
+    });
+    return decodeMessage(message);
   }
 
   /**
-   * Attachment bytes, decoded from Gmail's base64url envelope.
+   * `users.messages.attachments.get`: an attachment's content, its id from the
+   * message's `decoded.attachments`.
    *
-   * Gmail returns these inside a JSON body, so base64 inflates them by 4/3
-   * against the manifest's 20 MiB `maxResponseBytes` — an attachment much over
-   * ~15 MB raises `payload_too_large` rather than being truncated.
+   * Google sends the bytes as base64url inside JSON, a third larger than the
+   * file, against the manifest's 20 MiB `maxResponseBytes`: an attachment much
+   * over 15 MB fails as `payload_too_large` rather than arriving cut short.
    */
-  async getAttachment(
-    messageId: string,
-    attachmentId: string,
-  ): Promise<{ size: number; data: Buffer } | null> {
-    const body = await this.request(
-      `/gmail/v1/users/me/messages/${encodeURIComponent(messageId)}` +
-        `/attachments/${encodeURIComponent(attachmentId)}`,
+  async getAttachment(messageId: string, attachmentId: string): Promise<GmailAttachment> {
+    const body = await this.requestBody(
+      `${messagePath(messageId)}/attachments/${encodeURIComponent(attachmentId)}`,
       undefined,
-      { schema: RawAttachment },
+      { schema: MessagePartBodySchema },
     );
-    if (!body?.data) return null;
-    const bytes = Buffer.from(body.data, "base64url");
-    return { size: body.size ?? bytes.byteLength, data: bytes };
+    return { ...body, bytes: Buffer.from(body.data ?? "", "base64url") };
   }
 
   /**
-   * Gmail takes `labelIds` as a repeated query parameter, which
-   * `RequestOptions.query` cannot express — it is a record applied with
-   * `searchParams.set()`. Building them into the path works because
-   * `resolveUrl` parses it with `new URL()`, which preserves an existing query
-   * string before the other parameters are set on top.
+   * `users.messages.send`: sends `raw`, an RFC 2822 message base64url-encoded,
+   * from the connected mailbox to the recipients in its To, Cc and Bcc headers.
    */
-  private messagesPath(labelIds?: string[]): string {
-    const base = "/gmail/v1/users/me/messages";
-    if (!labelIds?.length) return base;
-    const repeated = labelIds
-      .map((id) => `labelIds=${encodeURIComponent(id)}`)
-      .join("&");
-    return `${base}?${repeated}`;
+  async sendMessage(message: { raw: string; threadId?: string }): Promise<GmailMessage> {
+    const sent = await this.requestBody(`${ME}/messages/send`, json(message), {
+      schema: MessageSchema,
+    });
+    return decodeMessage(sent);
+  }
+
+  /**
+   * `users.messages.insert`: adds a message straight to the mailbox, as IMAP
+   * APPEND does, skipping most scanning and classification. It sends nothing.
+   */
+  async insertMessage(
+    message: MessageInput,
+    opts: InsertMessageOptions = {},
+  ): Promise<GmailMessage> {
+    const inserted = await this.requestBody(`${ME}/messages`, json(message), {
+      schema: MessageSchema,
+      query: { internalDateSource: opts.internalDateSource, deleted: opts.deleted },
+    });
+    return decodeMessage(inserted);
+  }
+
+  /**
+   * `users.messages.import`: adds a message to the mailbox as if it had
+   * arrived by email, scanned and classified. It sends nothing.
+   */
+  async importMessage(
+    message: MessageInput,
+    opts: ImportMessageOptions = {},
+  ): Promise<GmailMessage> {
+    const imported = await this.requestBody(`${ME}/messages/import`, json(message), {
+      schema: MessageSchema,
+      query: {
+        internalDateSource: opts.internalDateSource,
+        neverMarkSpam: opts.neverMarkSpam,
+        processForCalendar: opts.processForCalendar,
+        deleted: opts.deleted,
+      },
+    });
+    return decodeMessage(imported);
+  }
+
+  /** `users.messages.modify`: adds and removes labels on one message. */
+  async modifyMessage(id: string, changes: LabelChanges): Promise<GmailMessage> {
+    const modified = await this.requestBody(`${messagePath(id)}/modify`, json(changes), {
+      schema: MessageSchema,
+      idempotent: true,
+    });
+    return decodeMessage(modified);
+  }
+
+  /** `users.messages.batchModify`: the same label changes on up to 1,000 messages. */
+  async batchModifyMessages(
+    request: { ids: readonly string[] } & LabelChanges,
+  ): Promise<void> {
+    await this.request(`${ME}/messages/batchModify`, json(request), { idempotent: true });
+  }
+
+  /** `users.messages.trash`: moves a message to Trash, which Gmail empties after 30 days. */
+  async trashMessage(id: string): Promise<GmailMessage> {
+    const trashed = await this.requestBody(`${messagePath(id)}/trash`, EMPTY_POST, {
+      schema: MessageSchema,
+      idempotent: true,
+    });
+    return decodeMessage(trashed);
+  }
+
+  /** `users.messages.untrash`: takes a message back out of Trash. */
+  async untrashMessage(id: string): Promise<GmailMessage> {
+    const untrashed = await this.requestBody(`${messagePath(id)}/untrash`, EMPTY_POST, {
+      schema: MessageSchema,
+      idempotent: true,
+    });
+    return decodeMessage(untrashed);
+  }
+
+  // ── users.threads ────────────────────────────────────────────────────────
+
+  /** `users.threads.list`: one page of threads, newest first, with their snippets. */
+  async listThreads(opts: ListOptions = {}): Promise<ListThreadsResponse> {
+    return this.requestBody(`${ME}/threads`, undefined, {
+      schema: ListThreadsResponseSchema,
+      query: listQuery(opts),
+    });
+  }
+
+  /** `users.threads.get`: a conversation, its messages oldest first. */
+  async getThread(id: string, opts: GetThreadOptions = {}): Promise<GmailThread> {
+    const thread = await this.requestBody(threadPath(id), undefined, {
+      schema: ThreadWithMessagesSchema,
+      query: { format: opts.format, metadataHeaders: opts.metadataHeaders },
+    });
+    return decodeThread(thread);
+  }
+
+  /** `users.threads.modify`: adds and removes labels on every message in a thread. */
+  async modifyThread(id: string, changes: LabelChanges): Promise<GmailThread> {
+    const modified = await this.requestBody(`${threadPath(id)}/modify`, json(changes), {
+      schema: ThreadWithMessagesSchema,
+      idempotent: true,
+    });
+    return decodeThread(modified);
+  }
+
+  /** `users.threads.trash`: moves a whole thread to Trash. */
+  async trashThread(id: string): Promise<GmailThread> {
+    const trashed = await this.requestBody(`${threadPath(id)}/trash`, EMPTY_POST, {
+      schema: ThreadWithMessagesSchema,
+      idempotent: true,
+    });
+    return decodeThread(trashed);
+  }
+
+  /** `users.threads.untrash`: takes a whole thread back out of Trash. */
+  async untrashThread(id: string): Promise<GmailThread> {
+    const untrashed = await this.requestBody(`${threadPath(id)}/untrash`, EMPTY_POST, {
+      schema: ThreadWithMessagesSchema,
+      idempotent: true,
+    });
+    return decodeThread(untrashed);
+  }
+
+  // ── users.labels ─────────────────────────────────────────────────────────
+
+  /** `users.labels.list`: every label, Gmail's own and the mailbox's, without counts. */
+  async listLabels(): Promise<ListLabelsResponse> {
+    return this.requestBody(`${ME}/labels`, undefined, { schema: ListLabelsResponseSchema });
+  }
+
+  /** `users.labels.get`: one label, with its message and thread counts. */
+  async getLabel(id: string): Promise<Label> {
+    return this.requestBody(labelPath(id), undefined, { schema: LabelSchema });
+  }
+
+  /** `users.labels.create`: a new label. Gmail refuses a name already taken. */
+  async createLabel(label: LabelInput): Promise<Label> {
+    return this.requestBody(`${ME}/labels`, json(label), { schema: LabelSchema });
+  }
+
+  /** `users.labels.update`: replaces a label's name, visibility and color. */
+  async updateLabel(id: string, label: LabelInput): Promise<Label> {
+    return this.requestBody(labelPath(id), json({ ...label, id }, "PUT"), {
+      schema: LabelSchema,
+    });
+  }
+
+  /** `users.labels.patch`: changes only the fields given. */
+  async patchLabel(id: string, label: Partial<LabelInput>): Promise<Label> {
+    return this.requestBody(labelPath(id), json({ ...label, id }, "PATCH"), {
+      schema: LabelSchema,
+      idempotent: true,
+    });
+  }
+
+  /**
+   * `users.labels.delete`: deletes a label for good, taking it off every
+   * message and thread that has it. The messages stay.
+   */
+  async deleteLabel(id: string): Promise<void> {
+    await this.request(labelPath(id), { method: "DELETE" });
   }
 }
 
 // ── Decoding ────────────────────────────────────────────────────────────────
 
-function shapeMessage(raw: RawMessage): GmailMessage {
-  const headers = headerMap(raw.payload?.headers);
-  const parts = collect(raw.payload);
-
-  return {
-    id: raw.id,
-    threadId: raw.threadId,
-    labelIds: raw.labelIds ?? [],
-    snippet: raw.snippet ?? "",
-    internalDate: raw.internalDate ?? null,
-    sizeEstimate: raw.sizeEstimate ?? null,
-    headers,
-    from: headers.from ?? null,
-    to: headers.to ?? null,
-    cc: headers.cc ?? null,
-    subject: headers.subject ?? null,
-    date: headers.date ?? null,
-    text: parts.text,
-    html: parts.html,
-    attachments: parts.attachments,
+function decodeMessage(message: Message): GmailMessage {
+  const decoded: DecodedMessage = {
+    headers: headerMap(message.payload?.headers),
+    text: null,
+    html: null,
+    attachments: [],
   };
+  if (message.payload) walk(message.payload, decoded, 0);
+  return { ...message, decoded };
 }
 
-interface Collected {
-  text: string | null;
-  html: string | null;
-  attachments: GmailAttachmentRef[];
+function decodeThread(thread: z.infer<typeof ThreadWithMessagesSchema>): GmailThread {
+  return { ...thread, messages: thread.messages?.map(decodeMessage) };
 }
 
 /**
  * Walk Gmail's MIME part tree, taking the first `text/plain` and `text/html`
- * bodies and the metadata of anything with an attachment id.
+ * bodies and every part with an attachment id.
  *
  * A multipart message carries its content in nested `parts`; a plain one
  * carries it directly on `payload`. Both land here.
  */
-function collect(payload: RawPart | undefined): Collected {
-  const acc: Collected = { text: null, html: null, attachments: [] };
-  if (payload) walk(payload, acc, 0);
-  return acc;
-}
-
-function walk(part: RawPart, acc: Collected, depth: number): void {
+function walk(part: MessagePart, decoded: DecodedMessage, depth: number): void {
   if (depth > MAX_PART_DEPTH) return;
 
   const mimeType = part.mimeType ?? "";
   const { attachmentId, data, size } = part.body ?? {};
 
   if (attachmentId) {
-    acc.attachments.push({
+    decoded.attachments.push({
+      partId: part.partId,
       attachmentId,
       filename: part.filename ?? "",
       mimeType: mimeType || "application/octet-stream",
       size: size ?? 0,
     });
   } else if (data) {
-    if (mimeType === "text/plain" && acc.text === null) acc.text = decode(data);
-    else if (mimeType === "text/html" && acc.html === null) acc.html = decode(data);
+    if (mimeType === "text/plain" && decoded.text === null) decoded.text = decode(data);
+    else if (mimeType === "text/html" && decoded.html === null) decoded.html = decode(data);
   }
 
-  for (const child of part.parts ?? []) walk(child, acc, depth + 1);
+  for (const child of part.parts ?? []) walk(child, decoded, depth + 1);
 }
 
 /** Gmail encodes bodies with the URL-safe base64 alphabet. */
@@ -432,12 +605,8 @@ function decode(data: string): string {
  * because the keys come from the message and a header named `__proto__` should
  * be a lookup, not a surprise.
  */
-function headerMap(headers?: { name: string; value: string }[]): Record<string, string> {
+function headerMap(headers?: MessagePartHeader[]): Record<string, string> {
   const out = Object.create(null) as Record<string, string>;
   for (const header of headers ?? []) out[header.name.toLowerCase()] = header.value;
   return out;
-}
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(Math.max(Math.trunc(value), min), max);
 }

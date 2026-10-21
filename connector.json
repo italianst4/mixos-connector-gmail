@@ -1,9 +1,10 @@
 {
   "name": "gmail",
   "displayName": "Gmail",
+  "version": "1.0.0",
   "icon": "assets/icon.png",
   "description": "Highly popular email service by Google. Gmail tracks all of your email conversations.",
-  "tagline": "Read Gmail messages, threads and labels",
+  "tagline": "Read, send and label Gmail messages and threads",
   "keywords": [
     "email",
     "gmail",
@@ -48,13 +49,14 @@
       }
     ],
     "notes": {
-      "authorize": "Sign in as the SHARED MAILBOX ACCOUNT, not as yourself. Whichever account approves this is the mailbox everyone will read — read-only, so nothing can be sent, labelled or deleted.",
+      "authorize": "Sign in as the SHARED MAILBOX ACCOUNT, not as yourself. Whichever account approves this is the mailbox everyone will read. It can only read mail until you allow changes; then connect again to let it send, label and trash mail.",
       "verify": "This reports which mailbox you are actually connected to — worth reading before you rely on it."
     },
     "docs": [
       {
         "label": "Gmail API scopes reference",
-        "url": "https://developers.google.com/gmail/api/auth/scopes"
+        "url": "https://developers.google.com/gmail/api/auth/scopes",
+        "why": "Open it to see what each Gmail scope allows before you connect: read-only by default, and the scope that can send, label and trash mail only once you allow changes."
       }
     ]
   },
@@ -150,7 +152,7 @@
         "scope": "https://www.googleapis.com/auth/gmail.modify",
         "description": "Read, compose, and send emails from your Gmail account. This scope does not allow immediate, permanent deletion of threads and messages, bypassing the trash.",
         "access": "read-write",
-        "requested": false
+        "requested": "write"
       },
       {
         "scope": "https://www.googleapis.com/auth/gmail.metadata",
@@ -182,29 +184,129 @@
   },
   "telemetry": [
     {
+      "method": "getProfile",
+      "operation": "users.getProfile",
+      "description": "Read the mailbox profile"
+    },
+    {
       "method": "listMessages",
+      "operation": "users.messages.list",
       "description": "Listed or searched messages"
     },
     {
-      "method": "searchMessages",
-      "description": "Searched messages and read their contents"
-    },
-    {
       "method": "getMessage",
+      "operation": "users.messages.get",
       "description": "Read one message"
     },
     {
+      "method": "getAttachment",
+      "operation": "users.messages.attachments.get",
+      "description": "Downloaded an attachment"
+    },
+    {
+      "method": "sendMessage",
+      "operation": "users.messages.send",
+      "description": "Sent a message",
+      "mutates": true
+    },
+    {
+      "method": "insertMessage",
+      "operation": "users.messages.insert",
+      "description": "Added a message to the mailbox",
+      "mutates": true
+    },
+    {
+      "method": "importMessage",
+      "operation": "users.messages.import",
+      "description": "Imported a message into the mailbox",
+      "mutates": true
+    },
+    {
+      "method": "modifyMessage",
+      "operation": "users.messages.modify",
+      "description": "Changed the labels on a message",
+      "mutates": true
+    },
+    {
+      "method": "batchModifyMessages",
+      "operation": "users.messages.batchModify",
+      "description": "Changed the labels on several messages",
+      "mutates": true
+    },
+    {
+      "method": "trashMessage",
+      "operation": "users.messages.trash",
+      "description": "Moved a message to Trash",
+      "mutates": true
+    },
+    {
+      "method": "untrashMessage",
+      "operation": "users.messages.untrash",
+      "description": "Took a message out of Trash",
+      "mutates": true
+    },
+    {
+      "method": "listThreads",
+      "operation": "users.threads.list",
+      "description": "Listed or searched conversation threads"
+    },
+    {
       "method": "getThread",
+      "operation": "users.threads.get",
       "description": "Read one conversation thread"
     },
     {
+      "method": "modifyThread",
+      "operation": "users.threads.modify",
+      "description": "Changed the labels on a thread",
+      "mutates": true
+    },
+    {
+      "method": "trashThread",
+      "operation": "users.threads.trash",
+      "description": "Moved a thread to Trash",
+      "mutates": true
+    },
+    {
+      "method": "untrashThread",
+      "operation": "users.threads.untrash",
+      "description": "Took a thread out of Trash",
+      "mutates": true
+    },
+    {
       "method": "listLabels",
+      "operation": "users.labels.list",
       "description": "Listed mailbox labels"
     },
     {
-      "method": "getAttachment",
-      "description": "Downloaded an attachment"
+      "method": "getLabel",
+      "operation": "users.labels.get",
+      "description": "Read one label"
+    },
+    {
+      "method": "createLabel",
+      "operation": "users.labels.create",
+      "description": "Created a label",
+      "mutates": true
+    },
+    {
+      "method": "updateLabel",
+      "operation": "users.labels.update",
+      "description": "Replaced a label",
+      "mutates": true
+    },
+    {
+      "method": "patchLabel",
+      "operation": "users.labels.patch",
+      "description": "Changed a label",
+      "mutates": true
+    },
+    {
+      "method": "deleteLabel",
+      "operation": "users.labels.delete",
+      "description": "Deleted a label",
+      "mutates": true
     }
   ],
-  "lastUpdated": "2026-09-14T03:55:51.997Z"
+  "lastUpdated": "2026-10-21T01:18:07.835Z"
 }
