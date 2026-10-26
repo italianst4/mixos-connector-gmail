@@ -1,0 +1,6 @@
+[
+  {
+    "date": "2026-08-28",
+    "note": "First release: read-only access to one shared Google Workspace mailbox. Apps can search it and read its messages, threads, labels and attachments. An admin connects it once, signed in as the shared mailbox account."
+  }
+]
